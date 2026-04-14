@@ -6,14 +6,15 @@ import { parseAllSessions } from './parser.js'
 import { loadPricing } from './models.js'
 import { providers } from './providers/index.js'
 
-type Period = 'today' | 'week' | 'month' | '30days'
+type Period = 'today' | 'week' | 'month' | '30days' | 'all'
 
-const PERIODS: Period[] = ['today', 'week', '30days', 'month']
+const PERIODS: Period[] = ['today', 'week', '30days', 'month', 'all']
 const PERIOD_LABELS: Record<Period, string> = {
   today: 'Today',
   week: '7 Days',
   '30days': '30 Days',
   month: 'This Month',
+  all: 'All Time',
 }
 
 const MIN_WIDE = 90
@@ -78,6 +79,7 @@ function getDateRange(period: Period): { start: Date; end: Date } {
     case 'week': return { start: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7), end }
     case '30days': return { start: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30), end }
     case 'month': return { start: new Date(now.getFullYear(), now.getMonth(), 1), end }
+    case 'all': return { start: new Date(0), end }
   }
 }
 
@@ -121,7 +123,20 @@ function fit(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) : s.padEnd(n)
 }
 
-function Overview({ projects, label, width }: { projects: ProjectSummary[]; label: string; width: number }) {
+function computeAverages(projects: ProjectSummary[]): { weeklyAvg: number; monthlyAvg: number } | null {
+  const allSessions = projects.flatMap(p => p.sessions)
+  if (allSessions.length === 0) return null
+  const timestamps = allSessions.map(s => new Date(s.firstTimestamp).getTime()).filter(t => t > 0)
+  if (timestamps.length === 0) return null
+  const earliest = Math.min(...timestamps)
+  const now = Date.now()
+  const days = Math.max(1, (now - earliest) / (1000 * 60 * 60 * 24))
+  const totalCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
+  const dailyAvg = totalCost / days
+  return { weeklyAvg: dailyAvg * 7, monthlyAvg: dailyAvg * 30 }
+}
+
+function Overview({ projects, label, width, period }: { projects: ProjectSummary[]; label: string; width: number; period: Period }) {
   const totalCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const totalCalls = projects.reduce((s, p) => s + p.totalApiCalls, 0)
   const totalSessions = projects.reduce((s, p) => s + p.sessions.length, 0)
@@ -132,12 +147,19 @@ function Overview({ projects, label, width }: { projects: ProjectSummary[]; labe
   const totalCacheWrite = allSessions.reduce((s, sess) => s + sess.totalCacheWriteTokens, 0)
   const cacheHit = totalInput + totalCacheRead > 0
     ? (totalCacheRead / (totalInput + totalCacheRead)) * 100 : 0
+  const averages = (period === 'all' || period === '30days' || period === 'month') ? computeAverages(projects) : null
+  const daySpan = (() => {
+    if (period !== 'all') return null
+    const timestamps = allSessions.map(s => new Date(s.firstTimestamp).getTime()).filter(t => t > 0)
+    if (timestamps.length === 0) return null
+    return Math.ceil((Date.now() - Math.min(...timestamps)) / (1000 * 60 * 60 * 24))
+  })()
 
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={PANEL_COLORS.overview} paddingX={1} width={width}>
       <Text wrap="truncate-end">
         <Text bold color={ORANGE}>CodeBurn</Text>
-        <Text dimColor>  {label}</Text>
+        <Text dimColor>  {label}{daySpan !== null ? ` (${daySpan} days)` : ''}</Text>
       </Text>
       <Text wrap="truncate-end">
         <Text bold color={GOLD}>{formatCost(totalCost)}</Text>
@@ -152,6 +174,15 @@ function Overview({ projects, label, width }: { projects: ProjectSummary[]; labe
       <Text dimColor wrap="truncate-end">
         {formatTokens(totalInput)} in   {formatTokens(totalOutput)} out   {formatTokens(totalCacheRead)} cached   {formatTokens(totalCacheWrite)} written
       </Text>
+      {averages && (
+        <Text wrap="truncate-end">
+          <Text dimColor>avg  </Text>
+          <Text color={GOLD}>{formatCost(averages.weeklyAvg)}</Text>
+          <Text dimColor>/week   </Text>
+          <Text color={GOLD}>{formatCost(averages.monthlyAvg)}</Text>
+          <Text dimColor>/month</Text>
+        </Text>
+      )}
     </Box>
   )
 }
@@ -335,6 +366,87 @@ function McpBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: nu
   )
 }
 
+function WeeklySummary({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
+  const weeklyCosts: Record<string, { cost: number; calls: number }> = {}
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const turn of session.turns) {
+        if (!turn.timestamp) continue
+        const d = new Date(turn.timestamp)
+        const day = d.getDay()
+        const monday = new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((day + 6) % 7))
+        const key = monday.toISOString().slice(0, 10)
+        if (!weeklyCosts[key]) weeklyCosts[key] = { cost: 0, calls: 0 }
+        weeklyCosts[key].cost += turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
+        weeklyCosts[key].calls += turn.assistantCalls.length
+      }
+    }
+  }
+  const sorted = Object.entries(weeklyCosts).sort(([a], [b]) => b.localeCompare(a))
+  if (sorted.length === 0) return <Panel title="Weekly Summary" color="#5BB5F5" width={pw}><Text dimColor>No data</Text></Panel>
+  const maxCost = Math.max(...sorted.map(([, d]) => d.cost))
+  const avgCost = sorted.reduce((s, [, d]) => s + d.cost, 0) / sorted.length
+  const avgCalls = Math.round(sorted.reduce((s, [, d]) => s + d.calls, 0) / sorted.length)
+
+  return (
+    <Panel title="Weekly Summary" color="#5BB5F5" width={pw}>
+      <Text dimColor wrap="truncate-end">{''.padEnd(6 + bw)}{'cost'.padStart(8)}{'calls'.padStart(7)}</Text>
+      {sorted.slice(0, 12).map(([week, data]) => (
+        <Text key={week} wrap="truncate-end">
+          <Text dimColor>{week.slice(5)} </Text>
+          <HBar value={data.cost} max={maxCost} width={bw} />
+          <Text color={GOLD}>{formatCost(data.cost).padStart(8)}</Text>
+          <Text>{String(data.calls).padStart(7)}</Text>
+        </Text>
+      ))}
+      <Text wrap="truncate-end">
+        <Text dimColor>{'avg'.padEnd(6 + bw)}</Text>
+        <Text color={GOLD}>{formatCost(avgCost).padStart(8)}</Text>
+        <Text>{String(avgCalls).padStart(7)}</Text>
+      </Text>
+    </Panel>
+  )
+}
+
+function MonthlySummary({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
+  const monthlyCosts: Record<string, { cost: number; calls: number }> = {}
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const turn of session.turns) {
+        if (!turn.timestamp) continue
+        const key = turn.timestamp.slice(0, 7)
+        if (!monthlyCosts[key]) monthlyCosts[key] = { cost: 0, calls: 0 }
+        monthlyCosts[key].cost += turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
+        monthlyCosts[key].calls += turn.assistantCalls.length
+      }
+    }
+  }
+  const sorted = Object.entries(monthlyCosts).sort(([a], [b]) => b.localeCompare(a))
+  if (sorted.length === 0) return <Panel title="Monthly Summary" color="#B55BF5" width={pw}><Text dimColor>No data</Text></Panel>
+  const maxCost = Math.max(...sorted.map(([, d]) => d.cost))
+  const avgCost = sorted.reduce((s, [, d]) => s + d.cost, 0) / sorted.length
+  const avgCalls = Math.round(sorted.reduce((s, [, d]) => s + d.calls, 0) / sorted.length)
+
+  return (
+    <Panel title="Monthly Summary" color="#B55BF5" width={pw}>
+      <Text dimColor wrap="truncate-end">{''.padEnd(8 + bw)}{'cost'.padStart(8)}{'calls'.padStart(7)}</Text>
+      {sorted.slice(0, 12).map(([month, data]) => (
+        <Text key={month} wrap="truncate-end">
+          <Text dimColor>{month.padEnd(8)}</Text>
+          <HBar value={data.cost} max={maxCost} width={bw} />
+          <Text color={GOLD}>{formatCost(data.cost).padStart(8)}</Text>
+          <Text>{String(data.calls).padStart(7)}</Text>
+        </Text>
+      ))}
+      <Text wrap="truncate-end">
+        <Text dimColor>{'avg'.padEnd(8 + bw)}</Text>
+        <Text color={GOLD}>{formatCost(avgCost).padStart(8)}</Text>
+        <Text>{String(avgCalls).padStart(7)}</Text>
+      </Text>
+    </Panel>
+  )
+}
+
 function BashBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
   const bashTotals: Record<string, number> = {}
   for (const project of projects) {
@@ -411,7 +523,9 @@ function StatusBar({ width, showProvider }: { width: number; showProvider?: bool
         <Text color={ORANGE} bold>3</Text>
         <Text dimColor> 30 days   </Text>
         <Text color={ORANGE} bold>4</Text>
-        <Text dimColor> month</Text>
+        <Text dimColor> month   </Text>
+        <Text color={ORANGE} bold>5</Text>
+        <Text dimColor> all</Text>
         {showProvider && (
           <>
             <Text dimColor>   </Text>
@@ -429,7 +543,7 @@ function Row({ wide, width, children }: { wide: boolean; width: number; children
   return <>{children}</>
 }
 
-function DashboardContent({ projects, period }: { projects: ProjectSummary[]; period: Period }) {
+function DashboardContent({ projects, period, allProjects }: { projects: ProjectSummary[]; period: Period; allProjects?: ProjectSummary[] }) {
   const { dashWidth, wide, halfWidth, barWidth } = getLayout()
 
   if (projects.length === 0) {
@@ -441,13 +555,14 @@ function DashboardContent({ projects, period }: { projects: ProjectSummary[]; pe
   }
 
   const pw = wide ? halfWidth : dashWidth
+  const summaryProjects = allProjects ?? projects
 
   return (
     <Box flexDirection="column" width={dashWidth}>
-      <Overview projects={projects} label={PERIOD_LABELS[period]} width={dashWidth} />
+      <Overview projects={projects} label={PERIOD_LABELS[period]} width={dashWidth} period={period} />
 
       <Row wide={wide} width={dashWidth}>
-        <DailyActivity projects={projects} days={period === 'month' || period === '30days' ? 31 : 14} pw={pw} bw={barWidth} />
+        <DailyActivity projects={projects} days={period === 'all' ? 90 : period === 'month' || period === '30days' ? 31 : 14} pw={pw} bw={barWidth} />
         <ProjectBreakdown projects={projects} pw={pw} bw={barWidth} />
       </Row>
 
@@ -462,18 +577,25 @@ function DashboardContent({ projects, period }: { projects: ProjectSummary[]; pe
         <BashBreakdown projects={projects} pw={pw} bw={barWidth} />
         <McpBreakdown projects={projects} pw={pw} bw={barWidth} />
       </Row>
+
+      <Row wide={wide} width={dashWidth}>
+        <WeeklySummary projects={summaryProjects} pw={pw} bw={barWidth} />
+        <MonthlySummary projects={summaryProjects} pw={pw} bw={barWidth} />
+      </Row>
     </Box>
   )
 }
 
-function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider }: {
+function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider, initialAllProjects }: {
   initialProjects: ProjectSummary[]
   initialPeriod: Period
   initialProvider: string
+  initialAllProjects?: ProjectSummary[]
 }) {
   const { exit } = useApp()
   const [period, setPeriod] = useState<Period>(initialPeriod)
   const [projects, setProjects] = useState<ProjectSummary[]>(initialProjects)
+  const [allProjects, setAllProjects] = useState<ProjectSummary[] | null>(initialAllProjects ?? null)
   const [loading, setLoading] = useState(false)
   const [activeProvider, setActiveProvider] = useState(initialProvider)
   const [detectedProviders, setDetectedProviders] = useState<string[]>([])
@@ -496,7 +618,13 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider 
         }
       }
     }
+    async function loadAll() {
+      const allRange = getDateRange('all')
+      const data = await parseAllSessions(allRange, activeProvider)
+      if (!cancelled) setAllProjects(data)
+    }
     detect()
+    loadAll()
     return () => { cancelled = true }
   }, [])
 
@@ -526,6 +654,7 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider 
       const next = options[(idx + 1) % options.length]
       setActiveProvider(next)
       reloadData(period, next)
+      parseAllSessions(getDateRange('all'), next).then(setAllProjects)
       return
     }
 
@@ -538,6 +667,7 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider 
     else if (input === '2') switchPeriod('week')
     else if (input === '3') switchPeriod('30days')
     else if (input === '4') switchPeriod('month')
+    else if (input === '5') switchPeriod('all')
   })
 
   if (loading) {
@@ -555,18 +685,18 @@ function InteractiveDashboard({ initialProjects, initialPeriod, initialProvider 
   return (
     <Box flexDirection="column" width={dashWidth}>
       <PeriodTabs active={period} providerName={activeProvider} showProvider={multipleProviders} />
-      <DashboardContent projects={projects} period={period} />
+      <DashboardContent projects={projects} period={period} allProjects={allProjects ?? undefined} />
       <StatusBar width={dashWidth} showProvider={multipleProviders} />
     </Box>
   )
 }
 
-function StaticDashboard({ projects, period }: { projects: ProjectSummary[]; period: Period }) {
+function StaticDashboard({ projects, period, allProjects }: { projects: ProjectSummary[]; period: Period; allProjects?: ProjectSummary[] }) {
   const { dashWidth } = getLayout()
   return (
     <Box flexDirection="column" width={dashWidth}>
       <PeriodTabs active={period} />
-      <DashboardContent projects={projects} period={period} />
+      <DashboardContent projects={projects} period={period} allProjects={allProjects} />
     </Box>
   )
 }
@@ -574,18 +704,21 @@ function StaticDashboard({ projects, period }: { projects: ProjectSummary[]; per
 export async function renderDashboard(period: Period = 'week', provider: string = 'all'): Promise<void> {
   await loadPricing()
   const range = getDateRange(period)
-  const projects = await parseAllSessions(range, provider)
+  const [projects, allTimeProjects] = await Promise.all([
+    parseAllSessions(range, provider),
+    period !== 'all' ? parseAllSessions(getDateRange('all'), provider) : Promise.resolve(undefined),
+  ])
 
   const isTTY = process.stdin.isTTY && process.stdout.isTTY
 
   if (isTTY) {
     const { waitUntilExit } = render(
-      <InteractiveDashboard initialProjects={projects} initialPeriod={period} initialProvider={provider} />
+      <InteractiveDashboard initialProjects={projects} initialPeriod={period} initialProvider={provider} initialAllProjects={allTimeProjects} />
     )
     await waitUntilExit()
   } else {
     const { unmount } = render(
-      <StaticDashboard projects={projects} period={period} />,
+      <StaticDashboard projects={projects} period={period} allProjects={allTimeProjects} />,
       { patchConsole: false }
     )
     unmount()

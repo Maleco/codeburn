@@ -44,10 +44,11 @@ function getDateRange(period: string): { range: DateRange; label: string } {
   }
 }
 
-function toPeriod(s: string): 'today' | 'week' | '30days' | 'month' {
+function toPeriod(s: string): 'today' | 'week' | '30days' | 'month' | 'all' {
   if (s === 'today') return 'today'
   if (s === 'month') return 'month'
   if (s === '30days') return '30days'
+  if (s === 'all') return 'all'
   return 'week'
 }
 
@@ -59,7 +60,7 @@ const program = new Command()
 program
   .command('report', { isDefault: true })
   .description('Interactive usage dashboard')
-  .option('-p, --period <period>', 'Starting period: today, week, month, 30days', 'week')
+  .option('-p, --period <period>', 'Starting period: today, week, month, 30days, all', 'week')
   .option('--provider <provider>', 'Filter by provider: all, claude, codex', 'all')
   .action(async (opts) => {
     await renderDashboard(toPeriod(opts.period), opts.provider)
